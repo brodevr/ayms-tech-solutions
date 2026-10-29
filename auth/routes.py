@@ -1,58 +1,79 @@
-from flask import Blueprint, redirect, url_for, session
-from authlib.integrations.flask_client import OAuth
-from flask_login import login_user
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
+from flask import Blueprint, redirect, url_for, session, flash
+from flask_login import login_user, logout_user, login_required, current_user
+
+from extensions import db, oauth
+from models import Usuario, ROL_ADMIN, ROL_CLIENTE
 
 auth_bp = Blueprint("auth", __name__)
-oauth = OAuth()
 
-google = oauth.register(
-    name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
+
+def init_oauth(app):
+    oauth.init_app(app)
+    oauth.register(
+        name="google",
+        client_id=app.config["GOOGLE_CLIENT_ID"],
+        client_secret=app.config["GOOGLE_CLIENT_SECRET"],
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+
+
+def _emails_admin():
+    raw = os.getenv("ADMIN_EMAILS") or os.getenv("ADMIN_EMAIL", "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def destino_por_rol(usuario):
+    return url_for("admin_dashboard" if usuario.es_admin else "mis_solicitudes")
+
 
 @auth_bp.route("/login")
 def login():
-    redirect_uri = url_for("auth.authorize", _external=True)
-    return google.authorize_redirect(redirect_uri)
+    if current_user.is_authenticated:
+        return redirect(destino_por_rol(current_user))
+    return oauth.google.authorize_redirect(url_for("auth.authorize", _external=True))
+
 
 @auth_bp.route("/authorize")
 def authorize():
-    token = google.authorize_access_token()
-    user_info = google.userinfo()
+    token = oauth.google.authorize_access_token()
+    info = token.get("userinfo") or oauth.google.userinfo()
 
-    session["user"] = {
-        "id": user_info["sub"],
-        "name": user_info["name"],
-        "email": user_info["email"],
-        "picture": user_info.get("picture", ""),
-    }
+    if not info.get("email_verified", True):
+        flash("Tu email de Google no esta verificado.", "error")
+        return redirect(url_for("home"))
 
-    from app import User
-    user = User(user_info["sub"], user_info["name"], user_info["email"], user_info.get("picture", ""))
-    login_user(user)
+    email = info["email"].lower()
 
-    # Crear o actualizar perfil en la base de datos
-    from models import db, UserProfile
-    admin_email = os.getenv("ADMIN_EMAIL", "")
-    is_admin = bool(admin_email and user_info["email"] == admin_email)
-    profile = UserProfile.query.filter_by(google_id=user_info["sub"]).first()
-    if not profile:
-        profile = UserProfile(
-            google_id=user_info["sub"],
-            email=user_info["email"],
-            name=user_info["name"],
-            is_admin=is_admin,
-        )
-        db.session.add(profile)
-    else:
-        profile.is_admin = is_admin
+    # Primero por google_id; si no, por email (adopta usuarios creados por el seed).
+    usuario = Usuario.query.filter_by(google_id=info["sub"]).first()
+    if not usuario:
+        usuario = Usuario.query.filter_by(email=email).first()
+    if not usuario:
+        usuario = Usuario(google_id=info["sub"], email=email, rol=ROL_CLIENTE)
+        db.session.add(usuario)
+
+    usuario.google_id = info["sub"]
+    usuario.nombre = info.get("name") or email
+    usuario.foto = info.get("picture", "")
+    # El admin se promueve por configuracion; nunca se degrada aqui a un admin ya existente.
+    if email in _emails_admin():
+        usuario.rol = ROL_ADMIN
     db.session.commit()
 
-    return redirect(url_for("profile"))
+    if not usuario.activo:
+        flash("Tu cuenta esta desactivada. Contacta a un administrador.", "error")
+        return redirect(url_for("home"))
+
+    login_user(usuario)
+    return redirect(destino_por_rol(usuario))
+
+
+@auth_bp.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    session.clear()
+    return redirect(url_for("home"))

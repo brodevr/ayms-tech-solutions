@@ -1,168 +1,110 @@
-from flask import Flask, render_template, session, redirect, url_for, request, abort
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from auth.routes import auth_bp, oauth
-from s3Service.s3service import s3_service
-from destinations.routes import destinations_bp
-from blog.routes import blog_bp
-from models import db, Review, Destination, BlogPost
-from dotenv import load_dotenv
-from collections import Counter
-from utils import get_is_admin
 import os
 
+import click
+from dotenv import load_dotenv
+from flask import Flask, render_template
+from flask_login import current_user
+
+from auth.routes import auth_bp, init_oauth
+from extensions import db, login_manager
+from models import Servicio, Solicitud, Usuario, ESTADOS
+from utils import admin_required, roles_required
 
 load_dotenv()
 
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY")
 
-app.config["GOOGLE_CLIENT_ID"] = os.getenv("GOOGLE_CLIENT_ID")
-app.config["GOOGLE_CLIENT_SECRET"] = os.getenv("GOOGLE_CLIENT_SECRET")
-oauth.init_app(app)
+def create_app(config=None):
+    app = Flask(__name__)
 
-database_url = os.getenv('DATABASE_URL', 'sqlite:///reviews.db')
-# Render entrega URLs con el prefijo "postgres://" pero SQLAlchemy requiere "postgresql://"
-if database_url.startswith('postgres://'):
-    database_url = database_url.replace('postgres://', 'postgresql://', 1)
-app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    secret = os.getenv("SECRET_KEY")
+    if not secret and not (config and config.get("TESTING")):
+        raise RuntimeError("Falta la variable de entorno SECRET_KEY.")
+    app.config["SECRET_KEY"] = secret or "test"
+    app.config["GOOGLE_CLIENT_ID"] = os.getenv("GOOGLE_CLIENT_ID")
+    app.config["GOOGLE_CLIENT_SECRET"] = os.getenv("GOOGLE_CLIENT_SECRET")
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = os.getenv("FLASK_ENV") == "production"
 
-db.init_app(app)
+    database_url = os.getenv("DATABASE_URL", "sqlite:///techsolutions.db")
+    # Render entrega "postgres://" pero SQLAlchemy requiere "postgresql://"
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 
-with app.app_context():
-    db.create_all()
-    # Seed automático si la base está vacía
-    if Destination.query.count() == 0:
-        from seed import run_seed
-        run_seed()
+    if config:
+        app.config.update(config)
 
-login_manager = LoginManager(app)
-login_manager.login_view = "auth.login"
+    db.init_app(app)
+    login_manager.init_app(app)
+    login_manager.login_view = "auth.login"
+    init_oauth(app)
+    app.register_blueprint(auth_bp)
 
-app.register_blueprint(auth_bp)
-app.register_blueprint(s3_service)
-app.register_blueprint(destinations_bp)
-app.register_blueprint(blog_bp)
+    # Las tablas se crean al arrancar; el seed es un comando explicito (flask seed).
+    with app.app_context():
+        db.create_all()
 
-class User(UserMixin):
-    def __init__(self, id_, name, email, picture=""):
-        self.id = id_
-        self.name = name
-        self.email = email
-        self.picture = picture
+    registrar_rutas(app)
+    registrar_comandos(app)
+    return app
+
 
 @login_manager.user_loader
 def load_user(user_id):
-    user_data = session.get("user")
-    if user_data and user_data["id"] == user_id:
-        return User(user_data["id"], user_data["name"], user_data["email"], user_data.get("picture", ""))
-    return None
+    return db.session.get(Usuario, int(user_id))
 
-@app.context_processor
-def inject_globals():
-    return {'is_admin': get_is_admin()}
 
-@app.errorhandler(403)
-def forbidden(_e):
-    return render_template("403.html"), 403
+def registrar_rutas(app):
+    @app.route("/")
+    def home():
+        return render_template("home.html")
 
-_sentiment_analyzer = None
+    @app.route("/mis-solicitudes")
+    @roles_required("cliente", "admin")
+    def mis_solicitudes():
+        servicios = Servicio.query.filter_by(cliente_id=current_user.id).all()
+        solicitudes = (Solicitud.query.filter_by(cliente_id=current_user.id)
+                       .order_by(Solicitud.creado.desc()).all())
+        return render_template("profile.html", servicios=servicios, solicitudes=solicitudes)
 
-def get_sentiment_analyzer():
-    global _sentiment_analyzer
-    if _sentiment_analyzer is None:
-        from pysentimiento import create_analyzer
-        _sentiment_analyzer = create_analyzer(task="sentiment", lang="es")
-    return _sentiment_analyzer
+    @app.route("/admin")
+    @admin_required
+    def admin_dashboard():
+        conteo = {e: Solicitud.query.filter_by(estado=e).count() for e in ESTADOS}
+        recientes = Solicitud.query.order_by(Solicitud.creado.desc()).limit(10).all()
+        return render_template("admin/dashboard.html",
+                               conteo=conteo,
+                               total_clientes=Usuario.query.filter_by(rol="cliente").count(),
+                               total_servicios=Servicio.query.count(),
+                               recientes=recientes)
 
-# ----------------------------------------
-# RUTAS PRINCIPALES
-# ----------------------------------------
-@app.route("/")
-def home():
-    featured = Destination.query.order_by(Destination.created_at.desc()).limit(6).all()
-    latest_posts = BlogPost.query.order_by(BlogPost.created_at.desc()).limit(3).all()
-    total_destinations = Destination.query.count()
-    total_reviews = Review.query.count()
-    total_posts = BlogPost.query.count()
-    return render_template("home.html",
-                           featured=featured,
-                           latest_posts=latest_posts,
-                           total_destinations=total_destinations,
-                           total_reviews=total_reviews,
-                           total_posts=total_posts)
+    @app.errorhandler(403)
+    def forbidden(_e):
+        return render_template("403.html"), 403
 
-@app.route("/profile")
-@login_required
-def profile():
-    user_reviews = Review.query.filter_by(user_id=current_user.id).all()
-    sentiments = [r.sentiment for r in user_reviews]
-    dominant_sentiment = Counter(sentiments).most_common(1)[0][0] if sentiments else None
+    @app.errorhandler(404)
+    def not_found(_e):
+        return render_template("404.html"), 404
 
-    sentiment_category_map = {
-        "POSITIVE": "aventura",
-        "NEGATIVE": "relax",
-        "Neutral": "cultura",
-    }
-    rec_category = sentiment_category_map.get(dominant_sentiment)
-    if rec_category:
-        recommended_destinations = Destination.query.filter_by(category=rec_category).limit(4).all()
-    else:
-        recommended_destinations = Destination.query.order_by(Destination.created_at.desc()).limit(4).all()
+    @app.errorhandler(500)
+    def server_error(_e):
+        db.session.rollback()
+        return render_template("500.html"), 500
 
-    all_destinations = Destination.query.order_by(Destination.name).all()
-    return render_template("profile.html",
-                           user=current_user,
-                           reviews=user_reviews,
-                           dominant_sentiment=dominant_sentiment,
-                           recommended_destinations=recommended_destinations,
-                           all_destinations=all_destinations)
 
-@app.route("/reviews", methods=["POST"])
-@login_required
-def add_review():
-    text = request.form.get("text")
-    destination_id = request.form.get("destination_id") or None
-    next_url = request.form.get("next") or url_for("profile")
-    if text:
-        result = get_sentiment_analyzer().predict(text)
-        label = result.output
-        if label == "POS":
-            sentiment = "POSITIVE"
-        elif label == "NEG":
-            sentiment = "NEGATIVE"
-        else:
-            sentiment = "Neutral"
+def registrar_comandos(app):
+    @app.cli.command("seed")
+    @click.option("--reset", is_flag=True, help="Borra todos los datos antes de cargar el seed.")
+    def seed_command(reset):
+        """Carga datos de ejemplo (idempotente)."""
+        from seed import run_seed
+        run_seed(reset=reset)
+        click.echo("Seed completado.")
 
-        review = Review(
-            user_id=current_user.id,
-            text=text,
-            sentiment=sentiment,
-            destination_id=int(destination_id) if destination_id else None,
-        )
-        db.session.add(review)
-        db.session.commit()
 
-    return redirect(next_url)
-
-@app.route("/admin")
-@login_required
-def admin_dashboard():
-    if not get_is_admin():
-        abort(403)
-    return render_template("admin/dashboard.html",
-                           total_destinations=Destination.query.count(),
-                           total_posts=BlogPost.query.count(),
-                           total_reviews=Review.query.count(),
-                           recent_destinations=Destination.query.order_by(Destination.created_at.desc()).limit(5).all(),
-                           recent_posts=BlogPost.query.order_by(BlogPost.created_at.desc()).limit(5).all())
-
-@app.route("/logout")
-@login_required
-def logout():
-    logout_user()
-    session.clear()
-    return redirect(url_for("home"))
+app = create_app()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1")

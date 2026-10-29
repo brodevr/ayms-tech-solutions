@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block title %}Error del servidor - Tech Solutions{% endblock %}
+{% block content %}
+<div class="error-page">
+    <span class="error-icon">⚠️</span>
+    <h1>Error del servidor</h1>
+    <p>Algo salio mal. Intenta de nuevo mas tarde.</p>
+    <a href="{{ url_for('home') }}" class="btn-primary">Volver al inicio</a>
+</div>
+{% endblock %}

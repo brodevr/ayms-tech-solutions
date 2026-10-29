@@ -1,22 +1,22 @@
 from functools import wraps
-from flask import redirect, url_for, abort
-from flask_login import current_user
+
+from flask import abort
+from flask_login import current_user, login_required
+
+
+def roles_required(*roles):
+    """Exige sesion iniciada y que el usuario tenga alguno de los roles dados."""
+    def decorador(f):
+        @wraps(f)
+        @login_required
+        def decorated(*args, **kwargs):
+            if current_user.rol not in roles:
+                abort(403)
+            return f(*args, **kwargs)
+        return decorated
+    return decorador
+
 
 def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not current_user.is_authenticated:
-            return redirect(url_for('auth.login'))
-        from models import UserProfile
-        profile = UserProfile.query.filter_by(google_id=current_user.id).first()
-        if not profile or not profile.is_admin:
-            abort(403)
-        return f(*args, **kwargs)
-    return decorated
-
-def get_is_admin():
-    if not current_user.is_authenticated:
-        return False
-    from models import UserProfile
-    profile = UserProfile.query.filter_by(google_id=current_user.id).first()
-    return bool(profile and profile.is_admin)
+    from models import ROL_ADMIN
+    return roles_required(ROL_ADMIN)(f)
